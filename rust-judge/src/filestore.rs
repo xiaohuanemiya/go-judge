@@ -56,13 +56,17 @@ impl FileStore {
     /// Store content from a byte slice; returns the new `fileId`.
     pub fn add(&self, name: &str, content: &[u8]) -> Result<String> {
         self.expire_old();
+        // Always store under the UUID – the human name is metadata only.
         let id = Uuid::new_v4().to_string();
         let path = self.inner.dir.join(&id);
         std::fs::write(&path, content)?;
+        // Sanitize the human-readable name: strip path separators so it
+        // cannot be used to traverse directories when echoed back to callers.
+        let safe_name = sanitize_filename(name);
         self.inner.files.insert(
             id.clone(),
             FileEntry {
-                name: name.to_string(),
+                name: safe_name,
                 path,
                 created_at: Instant::now(),
             },
@@ -138,4 +142,18 @@ impl FileStore {
             }
         });
     }
+}
+
+/// Remove path-traversal characters from a user-supplied filename.
+/// Returns just the final component (no slashes, no `..`).
+fn sanitize_filename(name: &str) -> String {
+    // Take only the last path component to neutralize traversal attempts.
+    let base = std::path::Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    // Additionally reject any remaining control characters.
+    base.chars()
+        .filter(|c| !c.is_control() && *c != '\0')
+        .collect()
 }

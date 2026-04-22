@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -304,8 +305,11 @@ async fn run_multi(
     output_limit: u64,
     copy_out_limit: u64,
 ) -> Vec<SandboxResult> {
-    let mut results = Vec::with_capacity(req.cmd.len());
-    for cmd in &req.cmd {
+    // Cap allocation to a reasonable maximum to prevent unbounded memory use.
+    const MAX_CMDS: usize = 64;
+    let count = req.cmd.len().min(MAX_CMDS);
+    let mut results = Vec::with_capacity(count);
+    for cmd in req.cmd.iter().take(MAX_CMDS) {
         let r = run_single(cmd, fs, work_dir, output_limit, copy_out_limit).await;
         results.push(r);
     }
@@ -385,6 +389,10 @@ fn run_process(cfg: ProcessConfig) -> SandboxResult {
     // Safety: we only call async-signal-safe libc functions between fork and exec.
     unsafe {
         cmd.pre_exec(move || {
+            // Create a new process group so we can kill all child processes
+            // later without risking killing unrelated processes.
+            libc::setpgid(0, 0);
+
             // CPU time in seconds (rounded up)
             if cpu_limit_ns > 0 {
                 let cpu_secs = ((cpu_limit_ns as f64) / 1e9).ceil() as u64;
@@ -427,13 +435,22 @@ fn run_process(cfg: ProcessConfig) -> SandboxResult {
     let pid = child.id() as libc::pid_t;
 
     // ── Clock-limit timer thread ─────────────────────────────────────────────
+    // Use an AtomicBool to cancel the timer once the process has been waited
+    // for, preventing accidental killing of a recycled PID.
     let clock_ns = cfg.clock_limit_ns;
+    let timer_cancelled = Arc::new(AtomicBool::new(false));
     if clock_ns > 0 {
+        let cancel_flag = Arc::clone(&timer_cancelled);
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_nanos(clock_ns));
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-                libc::kill(pid, libc::SIGKILL);
+            // Only send the signal if the process hasn't been waited for yet.
+            if !cancel_flag.load(Ordering::Acquire) {
+                unsafe {
+                    // Kill the entire process group created by setpgid(0,0).
+                    libc::kill(-pid, libc::SIGKILL);
+                    // Also try the leader in case setpgid failed.
+                    libc::kill(pid, libc::SIGKILL);
+                }
             }
         });
     }
@@ -500,6 +517,9 @@ fn run_process(cfg: ProcessConfig) -> SandboxResult {
             (status, ru)
         }
     };
+
+    // Cancel the timer now that the process has been waited for.
+    timer_cancelled.store(true, Ordering::Release);
 
     let wall_ns = start.elapsed().as_nanos() as u64;
 
