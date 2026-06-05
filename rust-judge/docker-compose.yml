@@ -1,0 +1,32 @@
+services:
+  rust-judge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rust-judge:latest
+    container_name: rust-judge
+    restart: unless-stopped
+    # --privileged is required for Linux namespaces / cgroup features
+    # (same requirement as the original go-judge)
+    privileged: true
+    shm_size: "256m"
+    ports:
+      - "5050:5050"
+    environment:
+      HTTP_ADDR: "0.0.0.0:5050"
+      PARALLELISM: "4"
+      WORK_DIR: "/tmp/rust-judge"
+      OUTPUT_LIMIT: "268435456"   # 256 MiB
+      COPY_OUT_LIMIT: "67108864"  # 64 MiB
+      FILE_TIMEOUT: "0"           # no TTL
+      LOG_LEVEL: "info"
+    volumes:
+      - rust_judge_data:/tmp/rust-judge
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5050/version || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  rust_judge_data:
